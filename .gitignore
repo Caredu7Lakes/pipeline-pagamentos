@@ -1,0 +1,12 @@
+# Segredos — nunca versionar
+.env
+*.key
+*.pem
+
+# Credenciais exportadas pela CLI do Confluent
+*api-key*.txt
+
+# Sistema / editores
+.DS_Store
+.idea/
+.vscode/

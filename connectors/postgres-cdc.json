@@ -1,0 +1,43 @@
+{
+  "//": "Conector gerenciado Debezium Postgres CDC Source (Confluent Cloud).",
+  "//_segredos": "Os valores __preencher__ vêm do .env. NUNCA comite senhas aqui.",
+
+  "name": "postgres-cdc-pagamentos",
+  "config": {
+    "connector.class": "PostgresCdcSource",
+    "//_identidade": "usa a chave de ESCRITA (writer) — least privilege",
+    "kafka.auth.mode": "KAFKA_API_KEY",
+    "kafka.api.key": "__WRITER_API_KEY__",
+    "kafka.api.secret": "__WRITER_API_SECRET__",
+
+    "//_banco": "conexão de leitura do WAL",
+    "database.hostname": "__POSTGRES_HOST__",
+    "database.port": "5432",
+    "database.user": "cdc_user",
+    "database.password": "__POSTGRES_CDC_PASSWORD__",
+    "database.dbname": "pagamentos",
+    "database.server.name": "pg",
+
+    "//_cdc": "plugin nativo do Postgres + publication criada à mão (ver README)",
+    "plugin.name": "pgoutput",
+    "publication.name": "dbz_pub",
+    "slot.name": "dbz_slot_pagamentos",
+
+    "//_tabelas": "só as tabelas de interesse são capturadas",
+    "table.include.list": "public.transacoes,public.contas",
+
+    "//_formato": "Avro + Schema Registry (Camada 2)",
+    "output.data.format": "AVRO",
+    "output.key.format": "AVRO",
+
+    "//_dlq": "evento com defeito vai para fila separada, NÃO para o conector",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "dlq-transacoes",
+    "errors.deadletterqueue.context.headers.enable": "true",
+
+    "//_snapshot": "lê o estado atual na primeira subida e depois só as mudanças",
+    "snapshot.mode": "initial",
+
+    "tasks.max": "1"
+  }
+}

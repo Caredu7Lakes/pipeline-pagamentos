@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "Transacao",
+  "namespace": "pagamentos",
+  "doc": "Contrato base (v1) da transacao capturada por CDC.",
+  "fields": [
+    { "name": "id_transacao", "type": "string" },
+    { "name": "id_cartao",    "type": "string" },
+    { "name": "id_conta",     "type": "string" },
+    { "name": "valor",        "type": { "type": "bytes", "logicalType": "decimal", "precision": 12, "scale": 2 } },
+    { "name": "moeda",        "type": "string", "default": "BRL" }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "Transacao",
+  "namespace": "pagamentos",
+  "doc": "v2 — adiciona 'canal'. Campo com DEFAULT = mudanca compativel (BACKWARD): consumidores da v1 continuam funcionando.",
+  "fields": [
+    { "name": "id_transacao", "type": "string" },
+    { "name": "id_cartao",    "type": "string" },
+    { "name": "id_conta",     "type": "string" },
+    { "name": "valor",        "type": { "type": "bytes", "logicalType": "decimal", "precision": 12, "scale": 2 } },
+    { "name": "moeda",        "type": "string", "default": "BRL" },
+
+    { "name": "canal", "type": "string", "default": "pos",
+      "doc": "Campo NOVO com default -> compativel. Remover um campo obrigatorio ou adicionar sem default quebraria BACKWARD." }
+  ]
+}
