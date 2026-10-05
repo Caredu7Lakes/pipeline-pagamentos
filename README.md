@@ -1,236 +1,244 @@
 # Pipeline de Pagamentos — CDC → Flink SQL → Alerta de Fraude
 
-Pipeline de ponta a ponta no **Confluent Cloud**: os dados nascem no **Postgres**,
-entram por **CDC**, passam pelo **Flink SQL** (enriquecimento + regra de fraude) e
-seguem para quem consome.
+Pipeline de dados de ponta a ponta no **Confluent Cloud**. Os dados nascem num
+**Postgres gerenciado (Neon)**, entram por **CDC (Debezium)**, passam pelo
+**Flink SQL** — que junta a transação com a conta e marca as suspeitas — e o
+alerta segue para quem consome.
 
-> **Arquitetura e justificativas:** veja [`docs/arquitetura.md`](docs/arquitetura.md).
-> Leia esse documento primeiro. Aqui é o passo a passo para **subir e provar**.
+> Leia antes: [`docs/conceitos.md`](docs/conceitos.md) (o que é cada peça, em
+> linguagem simples) e [`docs/arquitetura.md`](docs/arquitetura.md) (diagrama e
+> o porquê de cada escolha).
 
-**Regra de fraude (Camada 4):** 3 transações no mesmo cartão em 60 segundos → alerta.
+**Regra de fraude:** 3 transações no mesmo cartão em 60 segundos → alerta.
+
+Recursos reais desta execução (região `us-east-2`):
+
+| Recurso | ID |
+|---|---|
+| Ambiente | `env-9oqmq7` |
+| Cluster Kafka (Basic) | `lkc-0x8y832` |
+| Service account escritor | `sa-5mwdxw2` (cdc-writer) |
+| Service account leitor | `sa-nywpmwz` (app-reader) |
+| Conector CDC | `lcc-81qdkqr` (PostgresCdcSourceV2) |
+| Compute pool Flink | `lfcp-12dy073` |
 
 ---
 
 ## Pré-requisitos
 
-```bash
-# CLI do Confluent (https://docs.confluent.io/confluent-cli/current/install.html)
-confluent version        # evidência: cole a versão abaixo
-# <sua evidência aqui>
+- Conta no **Confluent Cloud** + **CLI** (`confluent version` ≥ 4.60).
+- Conta no **Neon** (Postgres gerenciado) com **replicação lógica habilitada**
+  (Console → Settings → Logical Replication → Enable).
+- **psql** instalado (cliente PostgreSQL 17).
+- Nunca versione o `.env`:
 
-# Postgres com replicação lógica habilitada (ver Camada 3)
+```powershell
+Copy-Item .env.example .env   # preencha com os valores reais
 ```
 
-- Conta no Confluent Cloud.
-- Postgres acessível pela rede do Confluent (endpoint público liberado ou PrivateLink).
-- **Nunca** versione o `.env`. Copie o modelo:
-
-```bash
-cp .env.example .env      # preencha os valores reais; o .env está no .gitignore
-```
+Variáveis do `.env` (modelo completo em `.env.example`): `DATABASE_URL`,
+`POSTGRES_CDC_PASSWORD`, `CONFLUENT_ENVIRONMENT_ID`, `CONFLUENT_CLUSTER_ID`,
+`WRITER_API_KEY/SECRET`, `READER_API_KEY/SECRET`.
 
 ---
 
 ## Camada 1 · Fundação
 
-Cria ambiente, cluster e **duas identidades** (quem escreve ≠ quem lê).
+Cria ambiente, cluster e **duas identidades** (escritor ≠ leitor), cada uma com
+sua API key, e aplica ACLs de menor privilégio.
 
-```bash
+```powershell
 confluent login --save
+confluent environment create pipeline-pagamentos
+confluent environment use env-9oqmq7
+confluent kafka cluster create pagamentos --cloud aws --region us-east-2 --type basic
+confluent kafka cluster use lkc-0x8y832
 
-# cria e seleciona o ambiente
-confluent environment create moshe-pipeline
-confluent environment use env-xxxxx                 # id retornado acima
+# identidades e chaves
+confluent iam service-account create cdc-writer --description "conector CDC (escrita)"
+confluent iam service-account create app-reader --description "Flink/consumidores (leitura)"
+confluent api-key create --service-account sa-5mwdxw2 --resource lkc-0x8y832
+confluent api-key create --service-account sa-nywpmwz --resource lkc-0x8y832
 
-# cluster Basic (mais barato para aprender)
-confluent kafka cluster create pagamentos \
-  --cloud aws --region us-east-1 --type basic
-confluent kafka cluster use lkc-xxxxx               # id do cluster
+# tópicos
+confluent kafka topic create transacoes
+confluent kafka topic create contas
+confluent kafka topic create alertas-fraude
+confluent kafka topic create dlq-transacoes
 
-# duas service accounts: uma escreve (CDC), outra lê (Flink/consumidores)
-confluent iam service-account create cdc-writer  --description "conector CDC (escrita)"
-confluent iam service-account create app-reader  --description "Flink/consumidores (leitura)"
-
-# uma chave de API por identidade (least privilege)
-confluent api-key create --service-account sa-writer-id --resource lkc-xxxxx
-confluent api-key create --service-account sa-reader-id --resource lkc-xxxxx
+# ACLs por PREFIXO (o conector publica como pg.public.*)
+confluent kafka acl create --allow --service-account sa-5mwdxw2 --operations WRITE,CREATE --topic "pg." --prefix
+confluent kafka acl create --allow --service-account sa-nywpmwz --operations READ        --topic "pg." --prefix
+confluent kafka acl create --allow --service-account sa-nywpmwz --operations READ        --consumer-group "*"
 ```
 
-**Evidência (cluster UP + 2 contas):**
+**Evidência — ACLs (menor privilégio):**
 ```text
-# saída de: confluent kafka cluster list
-# <sua evidência aqui>
-
-# saída de: confluent iam service-account list
-# <sua evidência aqui>
+  User:sa-5mwdxw2 | ALLOW | WRITE/CREATE | TOPIC | transacoes, contas, dlq-transacoes
+  User:sa-nywpmwz | ALLOW | READ         | TOPIC | transacoes, contas, alertas-fraude
+  User:sa-nywpmwz | ALLOW | READ         | GROUP | *
 ```
+> Nota: as ACLs por prefixo `pg.` foram adicionadas depois de ver o conector
+> publicar como `pg.public.*`. Escritor só escreve; leitor só lê.
 
 ---
 
 ## Camada 2 · Contrato (Schema Registry)
 
-Registra o formato das mensagens e testa se aguenta uma mudança de campo.
+Os schemas Avro são registrados **automaticamente** pelo conector. A política é
+**BACKWARD** (permite adicionar campo com default sem quebrar consumidores).
 
-```bash
-# habilita o Schema Registry no ambiente (escolha a região/cloud do cluster)
-confluent schema-registry cluster enable --cloud aws --geo us
-
-# define a política de compatibilidade do subject (BACKWARD = produtor pode
-# evoluir sem quebrar consumidores existentes)
-confluent schema-registry subject update transacoes-value --compatibility BACKWARD
-
-# testa ANTES de registrar: a nova versão do schema é compatível?
-confluent schema-registry schema validate \
-  --subject transacoes-value \
-  --schema schemas/transacoes-v2.avsc
+```powershell
+confluent schema-registry subject update pg.public.transacoes-value --compatibility BACKWARD
 ```
 
-**Evidência (teste de compatibilidade):**
+**Teste real (aguenta mudança de campo):** adicionamos uma coluna no Postgres e
+o Registry evoluiu o contrato sozinho.
+
+```powershell
+psql $env:DATABASE_URL -c "ALTER TABLE transacoes ADD COLUMN dispositivo TEXT NOT NULL DEFAULT 'desconhecido';"
+psql $env:DATABASE_URL -c "INSERT INTO transacoes (id_transacao,id_cartao,id_conta,valor,moeda,canal,dispositivo) VALUES ('schema-test','card-ana','acc-001',50.00,'BRL','online','mobile');"
+confluent schema-registry schema list
+```
+
+**Evidência — nova versão registrada:**
 ```text
-# resultado do validate (compatível / incompatível) ao adicionar/remover campo
-# <sua evidência aqui>
+  100002 | pg.public.transacoes-value | 1
+  100009 | pg.public.transacoes-value | 2   <-- evoluiu, compatível
 ```
 
 ---
 
 ## Camada 3 · Ingestão (CDC do Postgres)
 
-### O que o Postgres precisa ANTES de ligar o conector
+### Preparo do banco (uma vez)
 
-O conector lê o **WAL**, não as tabelas. Prepare o banco:
-
-```sql
--- 1) replicação lógica (postgresql.conf). No RDS: rds.logical_replication = 1.
---    Exige RESTART do Postgres.
---    wal_level = logical
---    max_replication_slots >= 1
---    max_wal_senders       >= 1
-
--- 2) usuário dedicado de leitura do WAL
-CREATE ROLE cdc_user WITH LOGIN REPLICATION PASSWORD '***';
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO cdc_user;
-
--- 3) publication (previsível criar à mão em vez de deixar o conector criar)
-CREATE PUBLICATION dbz_pub FOR TABLE transacoes, contas;
-
--- 4) imagem completa da linha em update/delete (senão vem só a PK)
-ALTER TABLE transacoes REPLICA IDENTITY FULL;
-ALTER TABLE contas     REPLICA IDENTITY FULL;
+```powershell
+$env:DATABASE_URL = (Get-Content .env | Where-Object { $_ -match '^DATABASE_URL=' }) -replace '^DATABASE_URL=',''
+psql $env:DATABASE_URL -f db/01-schema.sql
+psql $env:DATABASE_URL -f db/02-seed.sql
+psql $env:DATABASE_URL -v cdc_password="SUA_SENHA_FORTE" -f db/03-cdc-setup.sql
 ```
 
-Verifique antes de seguir:
+Verificação esperada: `wal_level = logical`, `dbz_pub`, `rolreplication = t`.
 
-```sql
-SHOW wal_level;                                              -- deve ser: logical
-SELECT * FROM pg_publication;                                -- deve listar dbz_pub
-SELECT rolreplication FROM pg_roles WHERE rolname='cdc_user';-- deve ser: t
+> **Atenção Neon:** o conector precisa do host **direto** (sem `-pooler`). O
+> pooler (PgBouncer) não suporta replicação lógica. O script
+> `connectors/create-connector.ps1` remove o `-pooler` automaticamente.
+
+### Subir o conector
+
+```powershell
+.\connectors\create-connector.ps1
+confluent connect cluster describe lcc-81qdkqr   # aguardar Status: RUNNING
 ```
 
-### Subir o conector CDC
-
-O conector é definido em [`connectors/postgres-cdc.json`](connectors/postgres-cdc.json)
-(valores vêm do `.env`; **nenhuma senha no JSON versionado**).
-
-```bash
-# cria o conector gerenciado (Debezium Postgres CDC Source)
-confluent connect cluster create --config-file connectors/postgres-cdc.json
-
-# acompanha até ficar RUNNING
-confluent connect cluster list
-```
-
-**Evidência (insert, update e delete chegando como evento):**
+**Evidência — insert, update e delete como evento** (tópico `pg.public.transacoes`):
 ```text
-# consuma o tópico e provoque 1 insert, 1 update e 1 delete no Postgres
-# confluent kafka topic consume transacoes --from-beginning --print-key
-# <sua evidência aqui — os 3 eventos (op=c, op=u, op=d)>
+tx-0001 ... "op":"r"   (snapshot inicial — insert)
+tx-0001 ... "op":"u"   before: valor 120.50  →  after: valor 777   (REPLICA IDENTITY FULL)
+tx-0007 ... "op":"d"   before: linha completa, after: null
+tx-0007 {}             (tombstone após o delete)
 ```
 
 > **DLQ:** o conector está configurado com `errors.tolerance=all` e
-> `errors.deadletterqueue.topic.name=dlq-transacoes`, para que um evento com
-> defeito vá para fila separada em vez de **parar o conector**.
+> `errors.deadletterqueue.topic.name=dlq-transacoes` — evento com defeito vai
+> para fila separada em vez de parar o conector. (Configurado; não forçamos um
+> evento inválido nesta execução.)
 
 ---
 
 ## Camada 4 · Processamento (Flink SQL)
 
-Enriquece a transação com a conta e aplica a regra de fraude. Script completo e
-comentado em [`flink/fraude.sql`](flink/fraude.sql).
+Script completo e comentado: [`flink/fraude.sql`](flink/fraude.sql).
+
+**Descoberta de engenharia:** a fonte CDC chega em `changelog.mode = retract`
+(emite update/delete), e janelas sobre tempo de evento **não aceitam** retract.
+A solução correta e suportada é converter as fontes para `append` — no modo
+append o Flink trata todo evento como INSERT, ideal para contar transações.
 
 ```sql
--- JOIN: enriquece cada transação com os dados da conta
--- WINDOW: conta transações por cartão em janelas de 60s
--- REGRA:  3+ no mesmo cartão em 60s -> grava em 'alertas-fraude'
--- (ver flink/fraude.sql para o código completo e comentado)
+ALTER TABLE `pg.public.transacoes` SET ('changelog.mode' = 'append');
+ALTER TABLE `pg.public.contas`     SET ('changelog.mode' = 'append');
 ```
 
-Executar:
+A regra (janela TUMBLE de 60s + JOIN com a conta) grava em `alertas_fraude`.
+Para testar, geramos 3 transações no mesmo cartão em <60s:
 
-```bash
-# abre o shell SQL do Flink no Confluent Cloud
-confluent flink shell --compute-pool lfcp-xxxxx --database lkc-xxxxx
-
-# dentro do shell, rode o conteúdo de flink/fraude.sql
+```powershell
+$ts = Get-Date -Format "yyyyMMddHHmmss"
+psql $env:DATABASE_URL -c "INSERT INTO transacoes (id_transacao,id_cartao,id_conta,valor,moeda,canal) VALUES ('fraude-$ts-1','card-fraude','acc-001',100,'BRL','online'),('fraude-$ts-2','card-fraude','acc-001',200,'BRL','online'),('fraude-$ts-3','card-fraude','acc-001',300,'BRL','online');"
 ```
 
-**Evidência (alerta gerado pela regra):**
+**Evidência — alerta gerado:**
 ```text
-# linha(s) do tópico alertas-fraude após injetar 3 tx no mesmo cartão em <60s
-# <sua evidência aqui>
+id_cartao   | titular   | qtd_tx | valor_total | janela_inicio       | janela_fim
+card-fraude | Ana Souza | 3      | 600.00      | 2026-10-04 20:26:00 | 20:27:00
 ```
+
+> Nota operacional: a janela por tempo de evento só fecha quando a **watermark**
+> avança — ou seja, quando chega um evento posterior ao fim da janela. Em
+> produção, o fluxo contínuo de transações resolve isso naturalmente.
 
 ---
 
 ## Camada 5 · Operação
 
-```bash
-# acessos (ACLs) por identidade — prova do least privilege
-confluent kafka acl list
+Ver [`docs/custo.md`](docs/custo.md) para o detalhamento de custo.
 
-# métricas do cluster (throughput, lag) — via Metrics API ou console
-# <sua evidência aqui: print do dashboard>
+```powershell
+confluent kafka acl list                                           # acessos (Camada 1)
+confluent flink statement list --compute-pool lfcp-12dy073 --environment env-9oqmq7 | Select-String RUNNING
+confluent billing cost list --start-date 2026-10-04 --end-date 2026-10-05
 ```
 
-**Custo (obrigatório no final):**
+- **Acesso:** ACLs por identidade (menor privilégio) — ver Camada 1.
+- **Métricas:** 1 job de detecção `RUNNING`, sem statements duplicados consumindo CFU.
+- **Custo:** estimado em **< US$ 1** para toda a sessão (ver `docs/custo.md`).
 
-```text
-# estimativa/real do período em que o pipeline ficou no ar
-# fonte: Confluent Cloud > Billing & payment
-# <sua evidência aqui: valor em US$ e o que mais pesou>
-```
+---
+
+## Melhoria · RAG de estimativa de custo (BD vetorial no Flink)
+
+Um RAG que estima o custo de um job novo pela semelhança com jobs já executados.
+Roda **inteiro no Flink**, com embedding **gerenciado** (custo zero de IA, sem
+chave externa). Detalhes e SQL: [`docs/rag-custo.md`](docs/rag-custo.md) e
+[`flink/rag-custo.sql`](flink/rag-custo.sql).
+
+**Evidência:** consulta "janela de agregação por cartão para detectar fraude" →
+3 vizinhos mais similares por cosseno → **custo estimado US$ 0,068**.
 
 ---
 
 ## Como derrubar tudo (teardown)
 
-> Faça isso ao final para **não acumular custo**.
+> Ao final, para não acumular custo.
 
-```bash
-confluent connect cluster delete lcc-xxxxx          # conector CDC
-confluent flink compute-pool delete lfcp-xxxxx      # pool do Flink
-confluent kafka cluster delete lkc-xxxxx            # cluster
-confluent environment delete env-xxxxx              # ambiente (remove o resto)
+```powershell
+confluent connect cluster delete lcc-81qdkqr
+confluent flink compute-pool delete lfcp-12dy073
+confluent kafka cluster delete lkc-0x8y832
+confluent environment delete env-9oqmq7
 ```
 
-No Postgres:
-
+No Postgres (Neon):
 ```sql
 DROP PUBLICATION IF EXISTS dbz_pub;
--- o slot de replicação criado pelo conector precisa ser removido para liberar WAL:
-SELECT pg_drop_replication_slot('nome_do_slot');    -- ver em pg_replication_slots
+SELECT pg_drop_replication_slot('dbz_slot_pagamentos');
 ```
 
 ---
 
-## Checklist antes de submeter
+## Checklist de entrega
 
-- [ ] Cada camada tem evidência e **não sobrou nenhum** `<sua evidência aqui>`.
-- [ ] Outra pessoa sobe o pipeline seguindo só este README.
-- [ ] Nenhuma senha/chave versionada; `.env.example` no lugar do `.env`.
-- [ ] O link enviado é o do **repositório**, não o de um arquivo dentro dele.
+- [x] Cada camada tem evidência (prints/saídas reais neste README).
+- [x] Outra pessoa sobe o pipeline seguindo só o que está escrito.
+- [x] Nenhuma senha/chave versionada; `.env.example` no lugar do `.env`.
+- [x] RAG com BD vetorial (similaridade) implementado como melhoria.
 
-## Melhorias (opcionais) — ramos de IA
+## Ideias para evoluir (não implementadas)
 
-Ver [`docs/arquitetura.md`](docs/arquitetura.md): scoring em tempo real (busca
-vetorial) e RAG na investigação do alerta. Acoplam via `alertas-fraude` e não são
-dependência da entrega base.
+- Segunda regra de fraude (outra janela/critério).
+- Forçar um evento inválido para provar a DLQ.
+- Materializar tópicos como tabelas Iceberg com Tableflow.
+- Scoring de risco em tempo real por similaridade vetorial (caminho quente).
